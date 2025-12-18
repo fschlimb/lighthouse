@@ -13,6 +13,7 @@ import numpy
 import logging
 import csv
 import os
+import argparse
 
 
 def run_experiment(
@@ -56,7 +57,7 @@ def run_experiment(
 
 
 class CSVLogger:
-    def __init__(self, filename=None):
+    def __init__(self, filename=None, cont=False):
         self.filename = filename
         self.header_written = False
         self.fieldnames = None
@@ -66,8 +67,10 @@ class CSVLogger:
         handler.setFormatter(logging.Formatter("%(message)s"))
         if not self.logger.hasHandlers():
             self.logger.addHandler(handler)
-        if self.filename is not None:
+        if self.filename is not None and not cont:
             assert not os.path.exists(self.filename), "CSV file already exist"
+        self.loaded = self._load() if cont else None
+        print(f"Loaded {len(self.loaded) if self.loaded else 0} existing entries")
 
     def log(self, data: dict):
         if self.fieldnames is None:
@@ -84,6 +87,46 @@ class CSVLogger:
                 writer.writeheader()
                 self.header_written = True
             writer.writerow(data)
+            
+    def _load(self):
+        # load existing CSV file as one string per row
+        with open(self.filename, mode="r") as csvfile:
+            # strip lines and create dict
+            data = [line.strip() for line in csvfile.readlines()]
+        fieldnames = data[0].split(",")
+        data = {tuple(line.split(',')): 1 for line in data[1:]}
+        data = {",".join(d[:-2]): 1 for d in data}
+        if self.fieldnames is None:
+            self.fieldnames = list(fieldnames)
+        # this is pretty ugly (also elsewhere), we should use the same fieldnames everywhere
+        fieldmap = {
+            "M": "M",
+            "N": "N",
+            "K": "K",
+            "wg_m": "auto_wg_d0",
+            "wg_n": "auto_wg_d1",
+            "sg_m": "auto_sg_d0",
+            "sg_n": "auto_sg_d1",
+            "k": "auto_k",
+            "load_a_m": "auto_load_a_d0",
+            "load_a_k": "auto_load_a_d1",
+            "load_b_k": "auto_load_b_d0",
+            "load_b_n": "auto_load_b_d1",
+            "pf_a_m": "auto_prefetch_a_d0",
+            "pf_a_k": "auto_prefetch_a_d1",
+            "pf_b_k": "auto_prefetch_b_d0",
+            "pf_b_n": "auto_prefetch_b_d1",
+            "pf_n": "auto_nb_prefetch",
+        }
+        self.new_fieldnames = [fieldmap[k] for k in self.fieldnames if k in fieldmap]
+        return data
+    
+    def contains(self, entry: dict):
+        if not self.loaded:
+            raise RuntimeError("No data loaded. Call _load() first.")
+        # check if data (except last two elements) is in existing CSV file  
+        key = ",".join(str(entry[k]) for k in self.new_fieldnames)
+        return key in self.loaded
 
 
 def check_constraints(params, verbose=False):
@@ -92,13 +135,14 @@ def check_constraints(params, verbose=False):
             print(f"  Invalid: {msg}")
 
     # hardware constraints
-    max_nb_sg_threads = 32
+    max_nb_sg_threads = 64
     dpas_tile = [8, 16, 16]
     load_max_rows = 32
+    nb_cores = 20
 
     # heuristics
     small_load_tile_elems = 16 * 16  # skip smaller load tiles
-    max_nb_unrolled_dpas_ops = 32
+    max_nb_unrolled_dpas_ops = 64
 
     M = params["M"]
     N = params["N"]
@@ -122,6 +166,9 @@ def check_constraints(params, verbose=False):
     if N % wg_tile_n != 0:
         print_reason("wg_tile_n does not divide N")
         return False
+    # if (M // wg_tile_m) * (N // wg_tile_n) > nb_cores:
+    #     print_reason(f"too many WG tiles for available cores")
+    #     return False
     if wg_tile_m % sg_tile_m != 0:
         print_reason("sg_tile_m does not divide wg_tile_m")
         return False
@@ -278,7 +325,7 @@ def check_constraints(params, verbose=False):
     return True
 
 
-def run_with_timeout(*args, timeout=10, **kwargs):
+def run_with_timeout(*args, timeout=5, **kwargs):
     """
     Wrapper to execute the experiment with a new thread and a timeout.
 
@@ -334,6 +381,7 @@ def run(
         "pf_a_k": params["auto_prefetch_a_d1"],
         "pf_b_k": params["auto_prefetch_b_d0"],
         "pf_b_n": params["auto_prefetch_b_d1"],
+        "pf_n": params["auto_nb_prefetch"],
     }
 
     try:
@@ -351,7 +399,7 @@ def run(
         entry["time (ms)"] = elapsed
         entry["GFLOPS/s"] = gflops
         csv_logger.log(entry)
-        duration_str = f"Duration: {duration:.3f} s"
+        duration_str = f"Duration: {duration:.3f} s GFLOP/s: {gflops:.2f}"
         print(duration_str)
     except Exception as e:
         print("FAILED")
@@ -373,6 +421,21 @@ def divisible_by(a_list, b):
 
 
 # --------------------
+#  args
+# --------------------
+parser = argparse.ArgumentParser(
+    description="tuning gridsearch for matmul",
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+)
+parser.add_argument(
+    "--continue", "-c",
+    dest="cont",
+    action="store_true",
+    help="skip configurations already existing in the CSV log file",
+)
+args = parser.parse_args()
+
+# --------------------
 #  driver
 # --------------------
 
@@ -380,13 +443,14 @@ def divisible_by(a_list, b):
 dry_run = False
 
 # fixed parameters
-sizes = [4096, 4096, 4096]
+# sizes = [4096, 4096, 4096]
+sizes = [2048, 2048, 2048]
 add_bias = False
 add_relu = False
 M, N, K = sizes
 ab_type = "f16"
 c_type = "f32"
-verbose = False
+verbose = True
 check_result = True
 dump_kernel = False
 nruns = 200
@@ -402,15 +466,15 @@ small_load_tile_elems = 16 * 16  # skip smaller load tiles
 os.environ["NEO_CACHE_PERSISTENT"] = "0"  # disable compiler cache
 
 csv_file = "out_gridsearch.csv"
-csv_logger = CSVLogger(csv_file)
+csv_logger = CSVLogger(csv_file, args.cont)
 
 wg_tiles_m = divisible_by(get_divisors(M, 64, 256), dpas_tile[0])
 wg_tiles_n = divisible_by(get_divisors(N, 64, 256), dpas_tile[1])
-sg_tiles_m = divisible_by(get_divisors(M, 32, 100), dpas_tile[0])
-sg_tiles_n = divisible_by(get_divisors(N, 32, 100), dpas_tile[1])
+sg_tiles_m = divisible_by(get_divisors(M, 32, 128), dpas_tile[0])
+sg_tiles_n = divisible_by(get_divisors(N, 32, 128), dpas_tile[1])
 k_tiles = divisible_by(get_divisors(K, 16, 50), dpas_tile[2])
 load_tiles = [8, 16, 32]
-nb_prefetch = 1
+prefetches = [1]
 
 print(f"Matmul problem size: {sizes}")
 print(f"{ab_type=}")
@@ -424,6 +488,7 @@ print(f"{sg_tiles_m=}")
 print(f"{sg_tiles_n=}")
 print(f"{k_tiles=}")
 print(f"{load_tiles=}")
+print(f"{prefetches=}")
 
 iterables = [
     wg_tiles_m,  # WG n
@@ -439,6 +504,7 @@ iterables = [
     load_tiles,  # prefetch tile A k
     load_tiles,  # prefetch tile B k
     load_tiles,  # prefetch tile B m
+    prefetches,  # nb prefetch
 ]
 total_complexity = numpy.prod([len(x) for x in iterables])
 print(f"Total complexity: {total_complexity} configurations")
@@ -459,6 +525,7 @@ for (
     prefetch_tile_a_k,
     prefetch_tile_b_k,
     prefetch_tile_b_n,
+    nb_prefetch,
 ) in product(*iterables):
     params = {
         "M": M,
@@ -480,6 +547,10 @@ for (
         "auto_nb_prefetch": nb_prefetch,
     }
 
+    if args.cont and csv_logger.contains(params):
+        print("SKIP existing configuration")
+        continue
+        
     if not check_constraints(params, verbose=False):
         continue
     i += 1
