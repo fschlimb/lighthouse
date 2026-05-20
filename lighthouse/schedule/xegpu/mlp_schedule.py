@@ -111,6 +111,7 @@ def params_with_constraints_imposed(
 def mlp_schedule(
     params: list[dict[str, int | None]],
     stop_at_stage: str = "",
+    start_from_gpu: bool = False,
 ) -> ir.Module:
     """Generate transform schedule module for MLP payload."""
     assert params is not None and len(params) > 0, "params must be provided."
@@ -134,6 +135,7 @@ def mlp_schedule(
                 payload_mod,
                 params=params,
                 stop_at_stage=stop_at_stage,
+                start_from_gpu=start_from_gpu,
             )
         except PipelineInterrupt:
             pass
@@ -147,6 +149,7 @@ def bundle_xegpu_mlp_schedule(
     mod: ir.Value[transform.AnyOpType],
     params: list[dict[str, int | KnobValue]],
     stop_at_stage: str = "",
+    start_from_gpu: bool = False,
 ) -> ir.Value[transform.AnyOpType]:
     """Schedule for lowering MLP-like payload to xegpu wg level."""
     nlayers = len(params)
@@ -156,129 +159,135 @@ def bundle_xegpu_mlp_schedule(
 
     anytype = transform.AnyOpType.get()
 
-    matmul_ops = match_and_split(mod, ops={"linalg.matmul"}, nhandles=nlayers)
+    if not start_from_gpu:
+        matmul_ops = match_and_split(mod, ops={"linalg.matmul"}, nhandles=nlayers)
 
-    # tile each layer separately
-    for matmul_op, layer_params in zip(matmul_ops, params):
-        # tunable parameters: wg and k tiling
-        wg_tile = [layer_params["wg_m"], layer_params["wg_n"]]
-        k_tile = layer_params["k_tile"]
+        # tile each layer separately
+        for matmul_op, layer_params in zip(matmul_ops, params):
+            # tunable parameters: wg and k tiling
+            wg_tile = [layer_params["wg_m"], layer_params["wg_n"]]
+            k_tile = layer_params["k_tile"]
 
-        # find the last tileable consumer of the matmul
-        consumers = transform_ext.get_tileable_consumers(matmul_op)
-        leaf_consumer_op = transform_ext.extract_handle(consumers, -1)
+            # find the last tileable consumer of the matmul
+            consumers = transform_ext.get_tileable_consumers(matmul_op)
+            leaf_consumer_op = transform_ext.extract_handle(consumers, -1)
 
-        # wg tiling
-        _, [wg_loop], _ = lh_transform.tile(
-            leaf_consumer_op,
-            tile_sizes=wg_tile,
-            fuse_producers=True,
-            use_forall=True,
-            apply_cleanup=False,
+            # wg tiling
+            _, [wg_loop], _ = lh_transform.tile(
+                leaf_consumer_op,
+                tile_sizes=wg_tile,
+                fuse_producers=True,
+                use_forall=True,
+                apply_cleanup=False,
+            )
+
+            # k loop tiling
+            wg_matmul = match(wg_loop, ops={"linalg.matmul"})
+            _, [k_loop], _ = lh_transform.tile(wg_matmul, tile_sizes=[0, 0, k_tile])
+
+        func = transform.get_parent_op(
+            anytype,
+            k_loop,
+            op_name="func.func",
+            deduplicate=True,
+        )
+        lh_transform.cleanup(func)
+
+        if stop_at_stage == "tiled":
+            raise PipelineInterrupt()
+
+        # vectorize
+        func = structured.structured_vectorize_children_and_apply_patterns(
+            transform.any_op_t(),
+            func,
+            fold_type_extensions_into_contract=True,
         )
 
-        # k loop tiling
-        wg_matmul = match(wg_loop, ops={"linalg.matmul"})
-        _, [k_loop], _ = lh_transform.tile(wg_matmul, tile_sizes=[0, 0, k_tile])
+        # hoist loop invariant vector read/store ops
+        k_loop = match(func, ops={"scf.for"})
+        lh_transform.loop_hoisting(k_loop)
+        lh_transform.cleanup(func)
 
-    func = transform.get_parent_op(
-        anytype,
-        k_loop,
-        op_name="func.func",
-        deduplicate=True,
-    )
-    lh_transform.cleanup(func)
+        if stop_at_stage == "vectorized":
+            raise PipelineInterrupt()
 
-    if stop_at_stage == "tiled":
-        raise PipelineInterrupt()
+        # bufferize
 
-    # vectorize
-    func = structured.structured_vectorize_children_and_apply_patterns(
-        transform.any_op_t(),
-        func,
-        fold_type_extensions_into_contract=True,
-    )
+        # eliminate empty tensors to avoid emitting extra copy ops
+        mod = apply_registered_pass(mod, "eliminate-empty-tensors")
+        identity_layout = LayoutMapOption.IdentityLayoutMap
+        mod = bufferization.OneShotBufferizeOp(
+            mod,
+            allow_return_allocs_from_loops=True,
+            bufferize_function_boundaries=True,
+            function_boundary_type_conversion=identity_layout,
+        ).result
+        # fold memref.subviews into vector.transfer_read/write ops
+        mod = apply_registered_pass(mod, "fold-memref-alias-ops")
+        transform.apply_cse(mod)
+        canonicalize(mod)
 
-    # hoist loop invariant vector read/store ops
-    k_loop = match(func, ops={"scf.for"})
-    lh_transform.loop_hoisting(k_loop)
-    lh_transform.cleanup(func)
+        if stop_at_stage == "bufferized":
+            raise PipelineInterrupt()
 
-    if stop_at_stage == "vectorized":
-        raise PipelineInterrupt()
+        # convert forall to parallel
+        wg_loops = match_and_split(mod, ops={"scf.forall"}, nhandles=nlayers)
+        for wg_loop in wg_loops:
+            wg_loop = loop.loop_forall_to_parallel([anytype], wg_loop)
+        func = transform.get_parent_op(anytype, wg_loop)
 
-    # bufferize
+        # convert to scf.parallel to gpu.launch
+        func = apply_registered_pass(func, "gpu-map-parallel-loops")
+        func = apply_registered_pass(func, "convert-parallel-loops-to-gpu")
+        func = apply_registered_pass(func, "lower-affine")
+        transform.apply_cse(func)
+        canonicalize(func)
 
-    # eliminate empty tensors to avoid emitting extra copy ops
-    mod = apply_registered_pass(mod, "eliminate-empty-tensors")
-    identity_layout = LayoutMapOption.IdentityLayoutMap
-    mod = bufferization.OneShotBufferizeOp(
-        mod,
-        allow_return_allocs_from_loops=True,
-        bufferize_function_boundaries=True,
-        function_boundary_type_conversion=identity_layout,
-    ).result
-    # fold memref.subviews into vector.transfer_read/write ops
-    mod = apply_registered_pass(mod, "fold-memref-alias-ops")
-    transform.apply_cse(mod)
-    canonicalize(mod)
+        # set correct number of gpu threads
+        launch_ops = match_and_split(mod, ops={"gpu.launch"}, nhandles=nlayers)
+        assert len(launch_ops) == nlayers
+        for launch_op, layer_params in zip(launch_ops, params):
+            # tunable parameters
+            wg_m, wg_n = layer_params["wg_m"], layer_params["wg_n"]
+            sg_m, sg_n = layer_params["sg_m"], layer_params["sg_n"]
 
-    if stop_at_stage == "bufferized":
-        raise PipelineInterrupt()
+            @td_smt_ext.constrain_params(wg_m, wg_n, sg_m, sg_n)
+            def constrain_wg_sg_and_calc_nb_threads(
+                WG_M: int | smt_ext.SMTIntValue,
+                WG_N: int | smt_ext.SMTIntValue,
+                SG_M: int | smt_ext.SMTIntValue,
+                SG_N: int | smt_ext.SMTIntValue,
+            ):
+                # NB: normal asserts in case of concrete values, SMT assert ops for symbolic values.
+                smt_ext.assert_(WG_M % SG_M == 0)
+                smt_ext.assert_(WG_N % SG_N == 0)
 
-    # convert forall to parallel
-    wg_loops = match_and_split(mod, ops={"scf.forall"}, nhandles=nlayers)
-    for wg_loop in wg_loops:
-        wg_loop = loop.loop_forall_to_parallel([anytype], wg_loop)
-    func = transform.get_parent_op(anytype, wg_loop)
+                # NB: normal ints in case of concrete values, SMT int values for symbolic values.
+                sg_m_threads = WG_M // SG_M
+                sg_n_threads = WG_N // SG_N
+                sg_threads = sg_m_threads * sg_n_threads
+                smt_ext.assert_(sg_threads <= MAX_NB_SG_THREADS, "too many SG threads")
+                smt_ext.assert_(sg_threads >= MIN_NB_THREADS, "too few SG threads")
 
-    # convert to scf.parallel to gpu.launch
-    func = apply_registered_pass(func, "gpu-map-parallel-loops")
-    func = apply_registered_pass(func, "convert-parallel-loops-to-gpu")
-    func = apply_registered_pass(func, "lower-affine")
-    transform.apply_cse(func)
-    canonicalize(func)
+                # number of threads collapsed to 1d layout
+                return sg_threads * NB_WORKITEMS
 
-    # set correct number of gpu threads
-    launch_ops = match_and_split(mod, ops={"gpu.launch"}, nhandles=nlayers)
-    assert len(launch_ops) == nlayers
-    for launch_op, layer_params in zip(launch_ops, params):
-        # tunable parameters
-        wg_m, wg_n = layer_params["wg_m"], layer_params["wg_n"]
-        sg_m, sg_n = layer_params["sg_m"], layer_params["sg_n"]
+            nb_threads: int | transform.AnyParamType = (
+                constrain_wg_sg_and_calc_nb_threads.results
+            )
 
-        @td_smt_ext.constrain_params(wg_m, wg_n, sg_m, sg_n)
-        def constrain_wg_sg_and_calc_nb_threads(
-            WG_M: int | smt_ext.SMTIntValue,
-            WG_N: int | smt_ext.SMTIntValue,
-            SG_M: int | smt_ext.SMTIntValue,
-            SG_N: int | smt_ext.SMTIntValue,
-        ):
-            # NB: normal asserts in case of concrete values, SMT assert ops for symbolic values.
-            smt_ext.assert_(WG_M % SG_M == 0)
-            smt_ext.assert_(WG_N % SG_N == 0)
+            xegpu.set_gpu_launch_threads(launch_op, threads=[nb_threads, 1, 1])
 
-            # NB: normal ints in case of concrete values, SMT int values for symbolic values.
-            sg_m_threads = WG_M // SG_M
-            sg_n_threads = WG_N // SG_N
-            sg_threads = sg_m_threads * sg_n_threads
-            smt_ext.assert_(sg_threads <= MAX_NB_SG_THREADS, "too many SG threads")
-            smt_ext.assert_(sg_threads >= MIN_NB_THREADS, "too few SG threads")
-
-            # number of threads collapsed to 1d layout
-            return sg_threads * NB_WORKITEMS
-
-        nb_threads: int | transform.AnyParamType = (
-            constrain_wg_sg_and_calc_nb_threads.results
-        )
-
-        xegpu.set_gpu_launch_threads(launch_op, threads=[nb_threads, 1, 1])
-
-    # outline gpu func
-    func = apply_registered_pass(func, "lower-affine")
-    canonicalize(func)
-    func = apply_registered_pass(func, "gpu-launch-sink-index-computations")
-    mod = apply_registered_pass(mod, "gpu-kernel-outlining")
+        # outline gpu func
+        func = apply_registered_pass(func, "lower-affine")
+        canonicalize(func)
+        func = apply_registered_pass(func, "gpu-launch-sink-index-computations")
+        mod = apply_registered_pass(mod, "gpu-kernel-outlining")
+        # else:  # starting from already outlined gpu.funcs
+        gpu_func = match(mod, ops={"gpu.func"})
+        k_loop = match(gpu_func, ops={"scf.for"})
+        transform.apply_licm(k_loop)
+        canonicalize(mod)
     transform.apply_cse(mod)
 
     # set xevm target

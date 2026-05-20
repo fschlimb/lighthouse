@@ -234,6 +234,41 @@ class Runner:
         return schedule
 
     @staticmethod
+    def get_host_launcher_schedule(
+        gpu_func_name: str | None = None, launcher_name: str = "payload"
+    ) -> ir.Module:
+        """
+        Get a schedule that creates a host launcher function for a gpu.func.
+        The launcher calls gpu.launch_func with grid/block sizes derived from the kernel.
+        If gpu_func_name is None, auto-detects the gpu.func (fails if more than one exists).
+        This schedule must apply to the module before any other in an optimizing pipeline.
+        """
+        with ir.Location.unknown():
+            with schedule_boilerplate(result_types=[transform.any_op_t()]) as (
+                schedule,
+                named_seq,
+            ):
+                match_kwargs = dict(
+                    ops={"gpu.func"},
+                )
+                if gpu_func_name is not None:
+                    match_kwargs["op_attrs"] = {
+                        "sym_name": ir.StringAttr.get(gpu_func_name)
+                    }
+                gpu_func = structured.structured_match(
+                    transform.AnyOpType.get(),
+                    target=named_seq.bodyTarget,
+                    **match_kwargs,
+                )
+                launcher_func = transform_ext.add_host_launcher(
+                    gpu_func, launcher_name=launcher_name
+                )
+                transform.yield_([launcher_func])
+
+        schedule.body.operations[0].verify()
+        return schedule
+
+    @staticmethod
     def get_gpu_argument_access_callback(
         host_buffer: np.ndarray,
         arg_index: int = 0,

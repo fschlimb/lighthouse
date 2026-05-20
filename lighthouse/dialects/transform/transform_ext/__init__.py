@@ -1,6 +1,7 @@
 from .dialect import register_and_load
 from .dialect import TransformExtensionDialect
 
+from .ops.add_host_launcher import add_host_launcher
 from .ops.wrap_in_benching_func import wrap_in_benching_func
 from .ops.get_named_attribute import get_named_attribute
 from .ops.param_cmp_eq import param_cmp_eq
@@ -13,6 +14,7 @@ from .ops.update_address_space import update_address_space
 
 __all__ = [
     "TransformExtensionDialect",
+    "add_host_launcher",
     "convert_func_results_to_args",
     "extract_handle",
     "get_named_attribute",
