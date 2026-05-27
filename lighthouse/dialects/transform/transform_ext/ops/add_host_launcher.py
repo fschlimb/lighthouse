@@ -53,6 +53,17 @@ def _derive_grid_and_block_sizes(gpu_func_op):
         }
         return grid_sizes, block_sizes
 
+    # Use known_block_size independently if available (set by
+    # xegpu.set_gpu_launch_threads in the schedule before outlining).
+    has_known_block_size = "known_block_size" in attrs
+    if has_known_block_size:
+        block_attr = attrs["known_block_size"]
+        known_block_sizes = {
+            "x": int(block_attr[0]),
+            "y": int(block_attr[1]),
+            "z": int(block_attr[2]),
+        }
+
     # Step 1: Find block_id ops and their muli constants.
     # Map: dimension -> (tile_size, muli_result_value)
     block_id_tiles = {}
@@ -158,10 +169,15 @@ def _derive_grid_and_block_sizes(gpu_func_op):
         if d not in grid_sizes:
             grid_sizes[d] = 1
 
-    # Block (thread) sizes: use tile_x as threads_x (matches typical XeGPU convention).
-    block_sizes = {"x": 1, "y": 1, "z": 1}
-    if "x" in block_id_tiles:
-        block_sizes["x"] = block_id_tiles["x"][0]
+    # Block (thread) sizes: use known_block_size if available (set by
+    # xegpu.set_gpu_launch_threads in the schedule, which computes
+    # nb_threads = (WG_M // SG_M) * (WG_N // SG_N) * NB_WORKITEMS).
+    if has_known_block_size:
+        block_sizes = known_block_sizes
+    else:
+        block_sizes = {"x": 1, "y": 1, "z": 1}
+        if "x" in block_id_tiles:
+            block_sizes["x"] = block_id_tiles["x"][0]
 
     return grid_sizes, block_sizes
 
@@ -192,10 +208,14 @@ class AddHostLauncherOp(TransformExtensionDialect.Operation, name="add_host_laun
         cls.MemoryEffectsOpInterfaceModel.attach(cls.OPERATION_NAME, context=context)
 
     @staticmethod
-    def create_host_launcher(gpu_func_op, launcher_name: str):
+    def create_host_launcher(
+        gpu_func_op, launcher_name: str, block_size: int | None = None
+    ):
         """Create a host function that calls gpu.launch_func on the target gpu.func."""
         module_name, func_name = _get_gpu_module_and_func_names(gpu_func_op)
         grid_sizes, block_sizes = _derive_grid_and_block_sizes(gpu_func_op)
+        if block_size is not None:
+            block_sizes = {"x": block_size, "y": 1, "z": 1}
 
         # Get the function argument types from the gpu.func.
         entry_block = gpu_func_op.body.blocks[0]
@@ -238,6 +258,10 @@ class AddHostLauncherOp(TransformExtensionDialect.Operation, name="add_host_laun
             else:
                 launcher_name = "payload"
 
+            block_size = None
+            if block_size_attr := op.attributes.get("block_size"):
+                block_size = int(block_size_attr)
+
             launcher_funcs = []
             for target in targets:
                 if target.OPERATION_NAME != "gpu.func":
@@ -247,7 +271,7 @@ class AddHostLauncherOp(TransformExtensionDialect.Operation, name="add_host_laun
                 gpu_module = target.parent
                 with ir.InsertionPoint(gpu_module), target.location:
                     launcher_func = AddHostLauncherOp.create_host_launcher(
-                        target, launcher_name
+                        target, launcher_name, block_size=block_size
                     )
                     launcher_funcs.append(launcher_func)
 
@@ -267,10 +291,16 @@ class AddHostLauncherOp(TransformExtensionDialect.Operation, name="add_host_laun
 
 
 def add_host_launcher(
-    target: ir.Value[transform.AnyOpType], launcher_name: str | None = None
+    target: ir.Value[transform.AnyOpType],
+    launcher_name: str | None = None,
+    block_size: int | None = None,
 ) -> ir.Value[transform.AnyOpType]:
     """snake_case wrapper to create an AddHostLauncherOp."""
     op = AddHostLauncherOp(target=target)
     if launcher_name is not None:
         op.attributes["launcher_name"] = ir.StringAttr.get(launcher_name)
+    if block_size is not None:
+        op.attributes["block_size"] = ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(64), block_size
+        )
     return op.launcher_func

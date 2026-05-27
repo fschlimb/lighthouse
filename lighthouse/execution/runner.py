@@ -235,7 +235,9 @@ class Runner:
 
     @staticmethod
     def get_host_launcher_schedule(
-        gpu_func_name: str | None = None, launcher_name: str = "payload"
+        gpu_func_name: str | None = None,
+        launcher_name: str = "payload",
+        block_size: int | None = None,
     ) -> ir.Module:
         """
         Get a schedule that creates a host launcher function for a gpu.func.
@@ -261,7 +263,7 @@ class Runner:
                     **match_kwargs,
                 )
                 launcher_func = transform_ext.add_host_launcher(
-                    gpu_func, launcher_name=launcher_name
+                    gpu_func, launcher_name=launcher_name, block_size=block_size
                 )
                 transform.yield_([launcher_func])
 

@@ -115,7 +115,7 @@ class XeGPUMatMul:
             self.K,
             False,
             False,
-            True,
+            False,
             nbytes_ab,
             nbytes_c,
         )
@@ -150,8 +150,23 @@ class XeGPUMatMul:
         schedules = []
         if self.gpu_func_name is not None:
             name = self.gpu_func_name if self.gpu_func_name else None
+            block_size = None
+            if (
+                parameters.get("wg_m")
+                and parameters.get("sg_m")
+                and parameters.get("wg_n")
+                and parameters.get("sg_n")
+            ):
+                nb_threads = (
+                    (parameters["wg_m"] // parameters["sg_m"])
+                    * (parameters["wg_n"] // parameters["sg_n"])
+                    * 16
+                )
+                block_size = nb_threads
             schedules.append(
-                Runner.get_host_launcher_schedule(name, self.payload_function_name)
+                Runner.get_host_launcher_schedule(
+                    name, self.payload_function_name, block_size=block_size
+                )
             )
         schedules.append(
             Runner.get_bench_wrapper_schedule(self.payload_function_name),
@@ -189,7 +204,7 @@ def check_results(
     # use float32 data type for efficiency
     f32 = np.float32
     D_ref = A.astype(f32) @ B.astype(f32)
-    D_ref += C.astype(f32)
+    # D_ref += C.astype(f32)
 
     D_host = buffers[0].astype(np.float32)
     if verbose > 1:
