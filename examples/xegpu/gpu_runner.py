@@ -70,6 +70,7 @@ class XeGPUMatMul:
     c_type: ir.Type | str | None = None
     mlir_file: Optional[str] = None
     gpu_func_name: Optional[str] = None
+    init_int: bool = False
 
     def __post_init__(self):
         if isinstance(self.ab_type, str):
@@ -96,6 +97,9 @@ class XeGPUMatMul:
 
         # use integer values to avoid f16/f32 floating point discrepancies
         def gen_random(shape, dtype):
+            if not self.init_int:
+                # generate values in range [-0.5, 0.5]
+                return (np.random.rand(*shape) - 0.5).astype(dtype)
             # generate values in range [-3, 3]
             a = np.random.randint(-3, 4, shape)
             return a.astype(dtype)
@@ -301,6 +305,11 @@ def parse_cli_args(description):
         help="Check the result of the matrix multiplication.",
     )
     parser.add_argument(
+        "--init-int",
+        action="store_true",
+        help="Initialize data with integers in range [-3, 3] instead of floats.",
+    )
+    parser.add_argument(
         "--nruns",
         type=int,
         default=1000,
@@ -350,6 +359,11 @@ def parse_cli_args(description):
         help="MLIR input file. If not provided or '-', read from stdin.",
     )
     args = parser.parse_args()
+
+    if args.check_result and not args.init_int:
+        parser.error(
+            "--check-result requires --init-int (float verification is not supported)."
+        )
 
     return args
 
@@ -432,6 +446,7 @@ CLI arguments take precedence over everything else.
             K=params["k"],
             mlir_file=args.input,
             gpu_func_name="",
+            init_int=args.init_int,
         )
 
         if args.dump_kernel or args.dump_schedule:

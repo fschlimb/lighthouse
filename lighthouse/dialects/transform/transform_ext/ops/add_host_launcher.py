@@ -64,6 +64,14 @@ def _derive_grid_and_block_sizes(gpu_func_op):
             "z": int(block_attr[2]),
         }
 
+    def _get_root_value(val):
+        while val.owner and val.owner.OPERATION_NAME in (
+            "arith.index_cast",
+            "arith.index_castui",
+        ):
+            val = val.owner.operands[0]
+        return val
+
     # Step 1: Find block_id ops and their muli constants.
     # Map: dimension -> (tile_size, muli_result_value)
     block_id_tiles = {}
@@ -80,9 +88,10 @@ def _derive_grid_and_block_sizes(gpu_func_op):
             operands = list(op.operands)
             for i, operand in enumerate(operands):
                 other = operands[1 - i]
-                # Check if this operand is a block_id result
+                # Check if this operand is a block_id result (possibly through casts)
+                root_operand = _get_root_value(operand)
                 for dim, bid_val in block_id_results.items():
-                    if operand == bid_val:
+                    if root_operand == bid_val:
                         # The other operand should be a constant
                         other_op = other.owner
                         if other_op.OPERATION_NAME == "arith.constant":

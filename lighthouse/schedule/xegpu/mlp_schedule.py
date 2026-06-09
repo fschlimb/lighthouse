@@ -283,7 +283,7 @@ def bundle_xegpu_mlp_schedule(
         canonicalize(func)
         func = apply_registered_pass(func, "gpu-launch-sink-index-computations")
         mod = apply_registered_pass(mod, "gpu-kernel-outlining")
-        # else:  # starting from already outlined gpu.funcs
+    else:  # starting from already outlined gpu.funcs
         gpu_func = match(mod, ops={"gpu.func"})
         k_loop = match(gpu_func, ops={"scf.for"})
         transform.apply_licm(k_loop)
