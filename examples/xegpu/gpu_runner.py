@@ -491,9 +491,13 @@ CLI arguments take precedence over everything else.
                 nwarmup=args.nwarmup,
             )
             times *= 1e6  # convert to microseconds
-            elapsed = np.mean(times)
+            elapsed_mean = np.mean(times)
+            elapsed_max = np.max(times)
+            elapsed_min = np.min(times)
             flop_count = wload.get_complexity()[0]
-            gflops = flop_count / (elapsed * 1e-6) / 1e9
+            gflops_mean = flop_count / (elapsed_mean * 1e-6) / 1e9
+            gflops_max = flop_count / (elapsed_min * 1e-6) / 1e9
+            gflops_min = flop_count / (elapsed_max * 1e-6) / 1e9
 
             def list2str(a):
                 return ",".join(map(str, a))
@@ -510,6 +514,8 @@ CLI arguments take precedence over everything else.
                 f"load-b-tile={list2str([params['load_b_k'], params['load_b_n']])} "
                 f"pf-a-tile={list2str([params['prefetch_a_m'], params['prefetch_a_k']])} "
                 f"pf-b-tile={list2str([params['prefetch_b_k'], params['prefetch_b_n']])} "
-                f"time(us): {elapsed:.2f} "
-                f"GFLOPS: {gflops:.2f}"
+                f"time_mean(us): {elapsed_mean:.2f} "
+                f"time_max(us): {elapsed_max:.2f} "
+                f"GFLOPS_mean: {gflops_mean:.2f} "
+                f"GFLOPS_max: {gflops_max:.2f}"
             )

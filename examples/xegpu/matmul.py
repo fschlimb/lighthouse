@@ -80,6 +80,7 @@ class XeGPUMatMul:
     has_bias: bool = False
     has_relu: bool = False
     accumulate_c: bool = True
+    init_int: bool = False
 
     def __post_init__(self):
         if isinstance(self.ab_type, str):
@@ -107,6 +108,9 @@ class XeGPUMatMul:
 
         # use integer values to avoid f16/f32 floating point discrepancies
         def gen_random(shape, dtype):
+            if not self.init_int:
+                # generate values in range [-0.5, 0.5]
+                return (np.random.rand(*shape) - 0.5).astype(dtype)
             # generate values in range [-3, 3]
             a = np.random.randint(-3, 4, shape)
             return a.astype(dtype)
@@ -310,6 +314,11 @@ def parse_cli_args(description):
         help="Check the result of the matrix multiplication.",
     )
     parser.add_argument(
+        "--init-int",
+        action="store_true",
+        help="Initialize data with integers in range [-3, 3] instead of floats.",
+    )
+    parser.add_argument(
         "--nruns",
         type=int,
         default=1000,
@@ -353,6 +362,11 @@ def parse_cli_args(description):
         help="Increase output verbosity (e.g. print reference and computed solutions).",
     )
     args = parser.parse_args()
+
+    if args.check_result and not args.init_int:
+        parser.error(
+            "--check-result requires --init-int (float verification is not supported)."
+        )
 
     return args
 
@@ -437,6 +451,7 @@ enabled via CLI arguments.
             has_bias=args.bias,
             has_relu=args.relu,
             accumulate_c=not args.no_accumulate_c,
+            init_int=args.init_int,
         )
 
         if args.dump_kernel or args.dump_schedule:
@@ -481,9 +496,13 @@ enabled via CLI arguments.
                 nwarmup=args.nwarmup,
             )
             times *= 1e6  # convert to microseconds
-            elapsed = np.mean(times)
+            elapsed_mean = np.mean(times)
+            elapsed_max = np.max(times)
+            elapsed_min = np.min(times)
             flop_count = wload.get_complexity()[0]
-            gflops = flop_count / (elapsed * 1e-6) / 1e9
+            gflops_mean = flop_count / (elapsed_mean * 1e-6) / 1e9
+            gflops_max = flop_count / (elapsed_min * 1e-6) / 1e9
+            gflops_min = flop_count / (elapsed_max * 1e-6) / 1e9
 
             def list2str(a):
                 return ",".join(map(str, a))
@@ -500,6 +519,8 @@ enabled via CLI arguments.
                 f"load-b-tile={list2str([params['load_b_k'], params['load_b_n']])} "
                 f"pf-a-tile={list2str([params['prefetch_a_m'], params['prefetch_a_k']])} "
                 f"pf-b-tile={list2str([params['prefetch_b_k'], params['prefetch_b_n']])} "
-                f"time(us): {elapsed:.2f} "
-                f"GFLOPS: {gflops:.2f}"
+                f"time_mean(us): {elapsed_mean:.2f} "
+                f"time_max(us): {elapsed_max:.2f} "
+                f"GFLOPS_mean: {gflops_mean:.2f} "
+                f"GFLOPS_max: {gflops_max:.2f}"
             )
